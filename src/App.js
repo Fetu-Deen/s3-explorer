@@ -14,7 +14,7 @@ const s3 = new S3Client({
   requestHandler: new XhrHttpHandler(),
 });
 
-const BUCKET_NAME = "marchs3fetu";  ///// Bucket name here
+const BUCKET_NAME = "fatu-s3-explorer-2026";  ///// Bucket name here
 
 const styles = `
   @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap');
