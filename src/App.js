@@ -10,7 +10,11 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { XhrHttpHandler } from "@aws-sdk/xhr-http-handler";
 
 const s3 = new S3Client({
-  region: "us-east-1",
+  region: process.env.REACT_APP_REGION,
+  credentials: {
+    accessKeyId: process.env.REACT_APP_AWS_ACCESS_KEY,
+    secretAccessKey: process.env.REACT_APP_AWS_SECRET,
+  },
   requestHandler: new XhrHttpHandler(),
 });
 
