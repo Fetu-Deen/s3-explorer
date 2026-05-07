@@ -4,21 +4,22 @@
 # =============================================================================
 #
 # Deletes EVERYTHING created by setup.sh in the correct order:
-#   1.  Remove S3 → Lambda notification
-#   2.  Remove Lambda permission for S3
-#   3.  Delete Lambda function
-#   4.  Terminate EC2 instance (wait until fully terminated)
-#   5.  Delete RDS instance    (wait until fully deleted)
-#   6.  Delete EC2 security group
-#   7.  Delete RDS security group
-#   8.  Delete EC2 IAM role + instance profile
-#   9.  Detach IAM Lambda role policies + delete role
-#   10. Empty S3 bucket (delete all files and thumbnails)
-#   11. Delete S3 bucket
-#   12. Delete EC2 key pair from AWS
-#   13. Delete local .pem key file
-#   14. Reset App.js API constant back to placeholder
-#   15. Delete this config file
+#   1.  Disable + delete CloudFront distribution + OAC
+#   2.  Remove S3 → Lambda notification
+#   3.  Remove Lambda permission for S3
+#   4.  Delete Lambda function
+#   5.  Terminate EC2 instance (wait until fully terminated)
+#   6.  Delete RDS instance    (wait until fully deleted)
+#   7.  Delete EC2 security group
+#   8.  Delete RDS security group
+#   9.  Delete EC2 IAM role + instance profile
+#   10. Detach IAM Lambda role policies + delete role
+#   11. Empty S3 bucket (delete all files and thumbnails)
+#   12. Delete S3 bucket
+#   13. Delete EC2 key pair from AWS
+#   14. Delete local .pem key file
+#   15. Reset App.js API constant back to placeholder
+#   16. Delete this config file
 #
 # Usage:
 #   chmod +x teardown.sh
@@ -88,7 +89,57 @@ load_config() {
 }
 
 # =============================================================================
-# STEP 1 — Remove S3 → Lambda notification
+# STEP 1 — Disable and delete CloudFront distribution
+# =============================================================================
+# CloudFront must be disabled before it can be deleted.
+# Disabling triggers a redeployment that takes ~5 minutes.
+# =============================================================================
+delete_cloudfront() {
+  print_step "1" "Disabling CloudFront distribution: $CF_DISTRIBUTION_ID"
+
+  # Get current config + ETag
+  CURRENT=$(aws cloudfront get-distribution-config --id "$CF_DISTRIBUTION_ID" 2>/dev/null)
+  if [ -z "$CURRENT" ]; then
+    print_skip "CloudFront distribution already deleted"
+    return
+  fi
+
+  ETAG=$(echo "$CURRENT" | jq -r '.ETag')
+  DISABLED_CONFIG=$(echo "$CURRENT" | jq '.DistributionConfig.Enabled = false | .DistributionConfig')
+
+  TMPFILE=$(mktemp)
+  echo "$DISABLED_CONFIG" > "$TMPFILE"
+
+  NEW_ETAG=$(aws cloudfront update-distribution \
+    --id "$CF_DISTRIBUTION_ID" \
+    --distribution-config "file://$TMPFILE" \
+    --if-match "$ETAG" \
+    --query "ETag" --output text)
+  rm "$TMPFILE"
+
+  echo -n "  Waiting for distribution to disable: "
+  while true; do
+    STATUS=$(aws cloudfront get-distribution \
+      --id "$CF_DISTRIBUTION_ID" \
+      --query "Distribution.Status" --output text 2>/dev/null)
+    [ "$STATUS" = "Deployed" ] && { echo ""; break; }
+    echo -n "."
+    sleep 15
+  done
+
+  aws cloudfront delete-distribution \
+    --id "$CF_DISTRIBUTION_ID" \
+    --if-match "$NEW_ETAG" 2>/dev/null || print_skip "Distribution already deleted"
+
+  # Delete the Origin Access Control
+  aws cloudfront delete-origin-access-control \
+    --id "$CF_OAC_ID" 2>/dev/null || print_skip "OAC already deleted"
+
+  print_ok "CloudFront distribution and OAC deleted"
+}
+
+# =============================================================================
+# STEP 2 — Remove S3 → Lambda notification
 # =============================================================================
 remove_s3_notification() {
   print_step "1" "Removing S3 event notification..."
@@ -392,21 +443,22 @@ print_summary() {
 main() {
   load_config              # load saved resource IDs from setup.sh
 
-  remove_s3_notification   # step 1  — disconnect S3 from Lambda
-  remove_lambda_permission # step 2  — revoke S3's right to invoke Lambda
-  delete_lambda            # step 3  — delete Lambda function
-  terminate_ec2            # step 4  — terminate EC2 + wait
-  delete_rds               # step 5  — delete RDS + wait
-  delete_ec2_sg            # step 6  — delete EC2 security group
-  delete_rds_sg            # step 7  — delete RDS security group
-  delete_ec2_role          # step 8  — delete EC2 IAM role + instance profile
-  delete_lambda_role       # step 9  — delete Lambda IAM role
-  empty_s3_bucket          # step 10 — delete all files in bucket
-  delete_s3_bucket         # step 11 — delete the bucket itself
-  delete_key_pair          # step 12 — delete key pair from AWS
-  delete_local_key         # step 13 — delete local .pem file
-  reset_app_js             # step 14 — reset App.js placeholder
-  delete_config            # step 15 — delete cloudvault-config.env
+  delete_cloudfront        # step 1  — disable + delete CloudFront + OAC
+  remove_s3_notification   # step 2  — disconnect S3 from Lambda
+  remove_lambda_permission # step 3  — revoke S3's right to invoke Lambda
+  delete_lambda            # step 4  — delete Lambda function
+  terminate_ec2            # step 5  — terminate EC2 + wait
+  delete_rds               # step 6  — delete RDS + wait
+  delete_ec2_sg            # step 7  — delete EC2 security group
+  delete_rds_sg            # step 8  — delete RDS security group
+  delete_ec2_role          # step 9  — delete EC2 IAM role + instance profile
+  delete_lambda_role       # step 10 — delete Lambda IAM role
+  empty_s3_bucket          # step 11 — delete all files in bucket
+  delete_s3_bucket         # step 12 — delete the bucket itself
+  delete_key_pair          # step 13 — delete key pair from AWS
+  delete_local_key         # step 14 — delete local .pem file
+  reset_app_js             # step 15 — reset App.js placeholder
+  delete_config            # step 16 — delete cloudvault-config.env
 
   print_summary
 }

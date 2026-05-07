@@ -57,6 +57,7 @@ SUFFIX=$(date +%s | tail -c 7)
 EC2_ROLE_NAME="cloudvault-ec2-role-${SUFFIX}"
 EC2_PROFILE_NAME="cloudvault-ec2-profile-${SUFFIX}"
 LAMBDA_ROLE_NAME="cloudvault-lambda-role-${SUFFIX}"
+CF_OAC_NAME="cloudvault-oac-${SUFFIX}"
 
 # ── Helper print functions ────────────────────────────────────────────────────
 print_banner() {
@@ -414,17 +415,14 @@ USERDATA
 }
 
 # =============================================================================
-# STEP 9 — Update React App.js with the new EC2 IP
+# STEP 9 — Set App.js API to empty string (relative URLs via CloudFront)
 # =============================================================================
 update_app_js() {
-  print_step "9" "Updating App.js with EC2 IP: $EC2_IP"
+  print_step "9" "Setting App.js API to relative URLs for CloudFront"
 
-  # Replace whatever IP was in the API constant with the new EC2 IP
-  sed -i '' \
-    "s|const API = \"http://.*:4000\"|const API = \"http://${EC2_IP}:4000\"|" \
-    "$APP_DIR/src/App.js"
+  sed -i '' "s|const API = \"[^\"]*\"|const API = \"\"|" "$APP_DIR/src/App.js"
 
-  print_ok "App.js updated → API points to http://${EC2_IP}:4000"
+  print_ok "App.js updated → API calls will route through CloudFront"
 }
 
 # =============================================================================
@@ -687,7 +685,197 @@ EOF
 }
 
 # =============================================================================
-# STEP 16 — Save config file (used by teardown.sh to delete everything)
+# STEP 16 — Build React and upload to S3
+# =============================================================================
+build_and_upload_react() {
+  print_step "16" "Building React app and uploading to S3..."
+
+  cd "$APP_DIR"
+  npm run build > /dev/null 2>&1
+  cd "$SCRIPT_DIR"
+
+  # Upload static assets with long cache (filenames are content-hashed)
+  aws s3 sync "$APP_DIR/build" "s3://${BUCKET_NAME}/app" \
+    --delete \
+    --cache-control "public, max-age=31536000, immutable" \
+    --exclude "index.html" \
+    > /dev/null
+
+  # index.html must never be cached — always fetch fresh on new deploys
+  aws s3 cp "$APP_DIR/build/index.html" "s3://${BUCKET_NAME}/app/index.html" \
+    --cache-control "no-cache, no-store, must-revalidate" \
+    > /dev/null
+
+  print_ok "React build uploaded to s3://${BUCKET_NAME}/app/"
+}
+
+# =============================================================================
+# STEP 17 — Create CloudFront distribution
+# =============================================================================
+# Two origins:
+#   - S3 (default /*): serves the React build via OAC (no public S3 access)
+#   - EC2 (/api/*):    proxies API requests, caching disabled
+# =============================================================================
+create_cloudfront() {
+  print_step "17" "Creating CloudFront distribution..."
+
+  # Get EC2 public DNS (CloudFront requires DNS hostname, not raw IP)
+  EC2_DNS=$(aws ec2 describe-instances \
+    --instance-ids "$EC2_INSTANCE_ID" \
+    --query "Reservations[0].Instances[0].PublicDnsName" \
+    --output text)
+
+  # Create Origin Access Control — allows CloudFront to access private S3
+  CF_OAC_ID=$(aws cloudfront create-origin-access-control \
+    --origin-access-control-config "{
+      \"Name\": \"${CF_OAC_NAME}\",
+      \"Description\": \"OAC for CloudVault S3 origin\",
+      \"SigningProtocol\": \"sigv4\",
+      \"SigningBehavior\": \"always\",
+      \"OriginAccessControlOriginType\": \"s3\"
+    }" \
+    --query "OriginAccessControl.Id" --output text)
+
+  # Create distribution config file
+  DIST_CONFIG=$(mktemp)
+  cat > "$DIST_CONFIG" << EOF
+{
+  "CallerReference": "cloudvault-${SUFFIX}",
+  "Comment": "CloudVault CDN ${SUFFIX}",
+  "DefaultRootObject": "index.html",
+  "Enabled": true,
+  "PriceClass": "PriceClass_100",
+  "Origins": {
+    "Quantity": 2,
+    "Items": [
+      {
+        "Id": "s3-origin",
+        "DomainName": "${BUCKET_NAME}.s3.${REGION}.amazonaws.com",
+        "OriginPath": "/app",
+        "S3OriginConfig": { "OriginAccessIdentity": "" },
+        "OriginAccessControlId": "${CF_OAC_ID}"
+      },
+      {
+        "Id": "ec2-origin",
+        "DomainName": "${EC2_DNS}",
+        "CustomOriginConfig": {
+          "HTTPPort": 4000,
+          "HTTPSPort": 443,
+          "OriginProtocolPolicy": "http-only"
+        }
+      }
+    ]
+  },
+  "DefaultCacheBehavior": {
+    "TargetOriginId": "s3-origin",
+    "ViewerProtocolPolicy": "redirect-to-https",
+    "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6",
+    "AllowedMethods": {
+      "Quantity": 2,
+      "Items": ["GET", "HEAD"],
+      "CachedMethods": { "Quantity": 2, "Items": ["GET", "HEAD"] }
+    },
+    "Compress": true
+  },
+  "CacheBehaviors": {
+    "Quantity": 1,
+    "Items": [{
+      "PathPattern": "/api/*",
+      "TargetOriginId": "ec2-origin",
+      "ViewerProtocolPolicy": "https-only",
+      "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+      "OriginRequestPolicyId": "b689b0a8-53d0-40ab-baf2-68738e2966ac",
+      "AllowedMethods": {
+        "Quantity": 7,
+        "Items": ["GET","HEAD","OPTIONS","PUT","POST","PATCH","DELETE"],
+        "CachedMethods": { "Quantity": 2, "Items": ["GET","HEAD"] }
+      },
+      "Compress": false
+    }]
+  },
+  "CustomErrorResponses": {
+    "Quantity": 1,
+    "Items": [{
+      "ErrorCode": 404,
+      "ResponsePagePath": "/index.html",
+      "ResponseCode": "200",
+      "ErrorCachingMinTTL": 0
+    }]
+  }
+}
+EOF
+
+  DIST_RESULT=$(aws cloudfront create-distribution --distribution-config "file://$DIST_CONFIG")
+  rm "$DIST_CONFIG"
+
+  CF_DISTRIBUTION_ID=$(echo "$DIST_RESULT" | jq -r '.Distribution.Id')
+  CF_DIST_ARN=$(echo "$DIST_RESULT" | jq -r '.Distribution.ARN')
+  CF_DOMAIN=$(echo "$DIST_RESULT" | jq -r '.Distribution.DomainName')
+
+  # Grant CloudFront OAC read access to the S3 bucket
+  BUCKET_POLICY=$(cat << EOF2
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "AllowCloudFrontOAC",
+    "Effect": "Allow",
+    "Principal": { "Service": "cloudfront.amazonaws.com" },
+    "Action": "s3:GetObject",
+    "Resource": "arn:aws:s3:::${BUCKET_NAME}/*",
+    "Condition": {
+      "StringEquals": { "AWS:SourceArn": "${CF_DIST_ARN}" }
+    }
+  }]
+}
+EOF2
+)
+  aws s3api put-bucket-policy --bucket "$BUCKET_NAME" --policy "$BUCKET_POLICY"
+
+  print_ok "CloudFront distribution created: https://$CF_DOMAIN"
+  echo "  Waiting for CloudFront to deploy (~5 min)..."
+  echo -n "  Progress: "
+
+  while true; do
+    STATUS=$(aws cloudfront get-distribution \
+      --id "$CF_DISTRIBUTION_ID" \
+      --query "Distribution.Status" --output text)
+    [ "$STATUS" = "Deployed" ] && { echo ""; break; }
+    echo -n "."
+    sleep 15
+  done
+
+  print_ok "CloudFront deployed"
+}
+
+# =============================================================================
+# STEP 18 — Lock EC2 security group to CloudFront only
+# =============================================================================
+# Before: port 4000 open to 0.0.0.0/0 (anyone can hit EC2 directly)
+# After:  port 4000 only accessible from CloudFront edge nodes
+# =============================================================================
+lock_ec2_to_cloudfront() {
+  print_step "18" "Locking EC2 port 4000 to CloudFront only..."
+
+  CF_PREFIX_LIST="pl-3b927c52"
+
+  aws ec2 authorize-security-group-ingress \
+    --group-id "$EC2_SG_ID" \
+    --ip-permissions "[{
+      \"IpProtocol\": \"tcp\",
+      \"FromPort\": 4000,
+      \"ToPort\": 4000,
+      \"PrefixListIds\": [{\"PrefixListId\": \"${CF_PREFIX_LIST}\"}]
+    }]" > /dev/null
+
+  aws ec2 revoke-security-group-ingress \
+    --group-id "$EC2_SG_ID" \
+    --protocol tcp --port 4000 --cidr 0.0.0.0/0 > /dev/null
+
+  print_ok "EC2 port 4000 locked to CloudFront prefix list only"
+}
+
+# =============================================================================
+# STEP 19 — Save config file (used by teardown.sh to delete everything)
 # =============================================================================
 save_config() {
   print_step "16" "Saving infrastructure config..."
@@ -711,6 +899,9 @@ EC2_ROLE_NAME=${EC2_ROLE_NAME}
 EC2_PROFILE_NAME=${EC2_PROFILE_NAME}
 LAMBDA_FUNCTION_NAME=${LAMBDA_FUNCTION_NAME}
 LAMBDA_ROLE_NAME=${LAMBDA_ROLE_NAME}
+CF_DISTRIBUTION_ID=${CF_DISTRIBUTION_ID}
+CF_DOMAIN=${CF_DOMAIN}
+CF_OAC_ID=${CF_OAC_ID}
 EOF
 
   print_ok "Config saved: $CONFIG_FILE"
@@ -725,10 +916,11 @@ print_summary() {
   echo -e "${GREEN}║            CloudVault is fully deployed!                 ║${NC}"
   echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
   echo ""
-  echo -e "  ${CYAN}Start React app:${NC}"
-  echo -e "    cd $APP_DIR && npm start"
+  echo -e "  ${CYAN}Open CloudVault:${NC}"
+  echo -e "    https://$CF_DOMAIN"
   echo ""
   echo -e "  ${CYAN}Resources created:${NC}"
+  echo -e "    CloudFront:   https://$CF_DOMAIN"
   echo -e "    S3 bucket:    $BUCKET_NAME"
   echo -e "    RDS host:     $DB_HOST"
   echo -e "    EC2 IP:       $EC2_IP"
@@ -765,7 +957,10 @@ main() {
   deploy_server         # step 13 — copy + start Express server
   deploy_lambda         # step 14 — build + upload Lambda function
   setup_s3_trigger      # step 15 — connect S3 → Lambda
-  save_config           # step 16 — save resource IDs for teardown
+  build_and_upload_react # step 16 — build React + upload to S3
+  create_cloudfront     # step 17 — CloudFront distribution + OAC + S3 policy
+  lock_ec2_to_cloudfront # step 18 — restrict EC2 port 4000 to CF only
+  save_config           # step 19 — save resource IDs for teardown
   print_summary
 }
 
