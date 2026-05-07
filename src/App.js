@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 
-const API = "http://100.31.77.117:4000";
+const API = "http://23.20.37.93:4000";
 
 const styles = `
   @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap');
@@ -321,6 +321,37 @@ function formatDate(dateStr) {
   });
 }
 
+const IMAGE_EXTS = ["jpg", "jpeg", "png", "gif", "webp"];
+
+function isImage(name) {
+  return IMAGE_EXTS.includes(name.split(".").pop().toLowerCase());
+}
+
+function Thumbnail({ fileId, fileName }) {
+  const [url, setUrl] = useState(null);
+  const [imgError, setImgError] = useState(false);
+
+  useEffect(() => {
+    fetch(`${API}/api/files/${fileId}/thumbnail`)
+      .then((r) => r.json())
+      .then((d) => { if (d.url) setUrl(d.url); })
+      .catch(() => {});
+  }, [fileId]);
+
+  if (!url || imgError) return <div className="file-icon">{getFileIcon(fileName)}</div>;
+
+  return (
+    <div className="file-icon" style={{ padding: 0, overflow: "hidden" }}>
+      <img
+        src={url}
+        alt={fileName}
+        style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: 8 }}
+        onError={() => setImgError(true)}
+      />
+    </div>
+  );
+}
+
 export default function App() {
   const [files, setFiles] = useState([]);
   const [uploadFile, setUploadFile] = useState(null);
@@ -457,7 +488,10 @@ export default function App() {
             {files.map((file) => (
               <div className="file-item" key={file.id}>
                 <div className="file-info">
-                  <div className="file-icon">{getFileIcon(file.file_name)}</div>
+                  {isImage(file.file_name)
+                    ? <Thumbnail fileId={file.id} fileName={file.file_name} />
+                    : <div className="file-icon">{getFileIcon(file.file_name)}</div>
+                  }
                   <div className="file-details">
                     <div className="file-name" onClick={() => handleView(file.id, file.file_name)}>
                       {file.file_name}

@@ -54,6 +54,9 @@ REGION="us-east-1"
 
 # ── Unique suffix — appended to resource names to avoid conflicts on re-run ───
 SUFFIX=$(date +%s | tail -c 7)
+EC2_ROLE_NAME="cloudvault-ec2-role-${SUFFIX}"
+EC2_PROFILE_NAME="cloudvault-ec2-profile-${SUFFIX}"
+LAMBDA_ROLE_NAME="cloudvault-lambda-role-${SUFFIX}"
 
 # ── Helper print functions ────────────────────────────────────────────────────
 print_banner() {
@@ -122,16 +125,20 @@ prompt_secrets() {
   BUCKET_NAME="cloudvault-files-${SUFFIX}"
   echo -e "  ${CYAN}S3 bucket name:${NC} $BUCKET_NAME (auto-generated)"
 
-  # RDS password — user must type it (never hardcoded)
+  # RDS password — use env var if set, otherwise prompt interactively
   echo ""
-  while true; do
-    read -s -p "  Enter RDS database password (min 8 chars, no special chars @/\"): " DB_PASSWORD
-    echo ""
-    if [ ${#DB_PASSWORD} -ge 8 ]; then
-      break
-    fi
-    print_warn "Password must be at least 8 characters. Try again."
-  done
+  if [ -n "$DB_PASSWORD" ] && [ ${#DB_PASSWORD} -ge 8 ]; then
+    echo "  Using provided DB_PASSWORD (${#DB_PASSWORD} chars)"
+  else
+    while true; do
+      read -s -p "  Enter RDS database password (min 8 chars, no special chars @/\"): " DB_PASSWORD
+      echo ""
+      if [ ${#DB_PASSWORD} -ge 8 ]; then
+        break
+      fi
+      print_warn "Password must be at least 8 characters. Try again."
+    done
+  fi
 
   # Fixed DB settings
   DB_NAME="cloudvault"
@@ -163,32 +170,44 @@ create_s3_bucket() {
 }
 
 # =============================================================================
-# STEP 3 — Create IAM user for Express server
+# STEP 3 — Create IAM role + instance profile for EC2
 # =============================================================================
-# The Express server on EC2 needs credentials to:
-#   - PutObject (upload files)
-#   - GetObject (generate pre-signed URLs)
-#   - DeleteObject (delete files)
-# We create a dedicated IAM user and generate access keys stored in EC2's .env
+# EC2 uses a ROLE (not user keys) — AWS auto-injects temporary credentials
+# via the instance metadata service. No secrets stored in .env or code.
 # =============================================================================
-create_iam_user() {
-  print_step "3" "Creating IAM user: cloudvault-server1"
+create_ec2_role() {
+  print_step "3" "Creating IAM role for EC2: ${EC2_ROLE_NAME}"
 
-  aws iam create-user \
-    --user-name "cloudvault-server1" \
+  EC2_TRUST_POLICY='{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": { "Service": "ec2.amazonaws.com" },
+      "Action": "sts:AssumeRole"
+    }]
+  }'
+
+  aws iam create-role \
+    --role-name "${EC2_ROLE_NAME}" \
+    --assume-role-policy-document "$EC2_TRUST_POLICY" \
     > /dev/null
 
-  # Attach S3 full access (scoped to all S3 — narrowing to one bucket is ideal)
-  aws iam attach-user-policy \
-    --user-name "cloudvault-server1" \
+  aws iam attach-role-policy \
+    --role-name "${EC2_ROLE_NAME}" \
     --policy-arn "arn:aws:iam::aws:policy/AmazonS3FullAccess"
 
-  # Generate access keys — these go into the EC2 .env file
-  KEYS=$(aws iam create-access-key --user-name "cloudvault-server1")
-  IAM_ACCESS_KEY=$(echo "$KEYS" | jq -r '.AccessKey.AccessKeyId')
-  IAM_SECRET_KEY=$(echo "$KEYS" | jq -r '.AccessKey.SecretAccessKey')
+  aws iam create-instance-profile \
+    --instance-profile-name "${EC2_PROFILE_NAME}" \
+    > /dev/null
 
-  print_ok "IAM user created with access keys"
+  aws iam add-role-to-instance-profile \
+    --instance-profile-name "${EC2_PROFILE_NAME}" \
+    --role-name "${EC2_ROLE_NAME}"
+
+  print_ok "EC2 role and instance profile created: ${EC2_PROFILE_NAME}"
+
+  echo "  Waiting 15s for instance profile to propagate..."
+  sleep 15
 }
 
 # =============================================================================
@@ -198,7 +217,7 @@ create_iam_user() {
 # This is more secure than storing keys in code
 # =============================================================================
 create_lambda_role() {
-  print_step "4" "Creating IAM role for Lambda: cloudvault-lambda-role"
+  print_step "4" "Creating IAM role for Lambda: ${LAMBDA_ROLE_NAME}"
 
   # Trust policy — declares that the Lambda service can assume this role
   TRUST_POLICY='{
@@ -211,18 +230,18 @@ create_lambda_role() {
   }'
 
   LAMBDA_ROLE_ARN=$(aws iam create-role \
-    --role-name "cloudvault-lambda-role" \
+    --role-name "${LAMBDA_ROLE_NAME}" \
     --assume-role-policy-document "$TRUST_POLICY" \
     | jq -r '.Role.Arn')
 
   # Allow Lambda to read/write S3 (download original, upload thumbnail)
   aws iam attach-role-policy \
-    --role-name "cloudvault-lambda-role" \
+    --role-name "${LAMBDA_ROLE_NAME}" \
     --policy-arn "arn:aws:iam::aws:policy/AmazonS3FullAccess"
 
   # Allow Lambda to write logs to CloudWatch (for debugging)
   aws iam attach-role-policy \
-    --role-name "cloudvault-lambda-role" \
+    --role-name "${LAMBDA_ROLE_NAME}" \
     --policy-arn "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 
   print_ok "Lambda role created: $LAMBDA_ROLE_ARN"
@@ -301,7 +320,7 @@ create_rds() {
 
   aws rds create-db-instance \
     --db-instance-identifier "$DB_IDENTIFIER" \
-    --db-instance-class db.t3.micro \
+    --db-instance-class db.t4g.micro \
     --engine mysql \
     --master-username "$DB_USER" \
     --master-user-password "$DB_PASSWORD" \
@@ -366,12 +385,13 @@ USERDATA
 
   echo "  Using AMI: $AMI_ID"
 
-  # Launch the instance
+  # Launch the instance with the EC2 IAM instance profile attached
   EC2_INSTANCE_ID=$(aws ec2 run-instances \
     --image-id "$AMI_ID" \
-    --instance-type t2.micro \
+    --instance-type t3.micro \
     --key-name "$KEY_NAME" \
     --security-group-ids "$EC2_SG_ID" \
+    --iam-instance-profile Name="${EC2_PROFILE_NAME}" \
     --user-data "file://$USER_DATA_FILE" \
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=cloudvault-server}]" \
     | jq -r '.Instances[0].InstanceId')
@@ -501,8 +521,6 @@ deploy_server() {
   # ── Write .env to a local temp file (avoids shell escaping issues with SCP) ─
   ENV_FILE=$(mktemp)
   cat > "$ENV_FILE" << EOF
-AWS_ACCESS_KEY=${IAM_ACCESS_KEY}
-AWS_SECRET=${IAM_SECRET_KEY}
 AWS_REGION=${REGION}
 S3_BUCKET=${BUCKET_NAME}
 DB_HOST=${DB_HOST}
@@ -579,6 +597,7 @@ deploy_lambda() {
     cd ~/lambda-thumbnail
     npm init -y > /dev/null
     npm install sharp @aws-sdk/client-s3 > /dev/null
+    sudo dnf install -y zip > /dev/null 2>&1
     zip -r function.zip index.js node_modules/ > /dev/null
     echo "Zip size: $(du -sh function.zip | cut -f1)"
 ENDSSH
@@ -688,9 +707,10 @@ KEY_NAME=${KEY_NAME}
 KEY_PATH=${KEY_PATH}
 EC2_SG_ID=${EC2_SG_ID}
 RDS_SG_ID=${RDS_SG_ID}
-IAM_USER=cloudvault-server1
+EC2_ROLE_NAME=${EC2_ROLE_NAME}
+EC2_PROFILE_NAME=${EC2_PROFILE_NAME}
 LAMBDA_FUNCTION_NAME=${LAMBDA_FUNCTION_NAME}
-LAMBDA_ROLE_NAME=cloudvault-lambda-role
+LAMBDA_ROLE_NAME=${LAMBDA_ROLE_NAME}
 EOF
 
   print_ok "Config saved: $CONFIG_FILE"
@@ -732,7 +752,7 @@ main() {
   prompt_secrets        # step 1  — ask for DB password
 
   create_s3_bucket      # step 2  — S3 bucket
-  create_iam_user       # step 3  — IAM user + keys for Express
+  create_ec2_role       # step 3  — IAM role + instance profile for EC2
   create_lambda_role    # step 4  — IAM role for Lambda
   create_security_groups # step 5  — EC2 and RDS security groups
   create_rds            # step 6  — start RDS (async — we wait later)
