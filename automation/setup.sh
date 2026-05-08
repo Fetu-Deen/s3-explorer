@@ -23,13 +23,23 @@
 #   17. Creates CloudFront     — CDN with S3 origin (/*) and EC2 origin (/api/*)
 #   18. Locks EC2 SG           — port 4000 restricted to CloudFront IPs only
 #   19. Saves config           — writes cloudvault-config.env for teardown.sh
-#
 # Prerequisites (must be installed before running):
 #   - AWS CLI  → brew install awscli  (then: aws configure)
 #   - jq       → brew install jq
 #   - Node.js  → brew install node
 #   - ssh, scp → pre-installed on Mac
 #   - zip      → pre-installed on Mac
+#
+# Every time before running setup:
+#   - AWS free tier allows only 1 RDS instance. If you have a leftover
+#     instance from a previous run or another project, delete it first:
+#
+#     aws rds delete-db-instance \
+#       --db-instance-identifier <your-old-instance-id> \
+#       --skip-final-snapshot \
+#       --delete-automated-backups
+#
+#     Wait ~5 minutes for deletion to complete, then run setup.sh.
 #
 # Usage:
 #   chmod +x setup.sh
