@@ -400,17 +400,11 @@ delete_local_key() {
 # STEP 14 — Reset App.js API constant back to placeholder
 # =============================================================================
 reset_app_js() {
-  print_step "14" "Resetting App.js API constant..."
+  print_step "14" "Checking App.js API constant..."
 
-  APP_JS="$APP_DIR/src/App.js"
-  if [ -f "$APP_JS" ]; then
-    sed -i '' \
-      "s|const API = \"http://.*:4000\"|const API = \"http://YOUR_EC2_IP:4000\"|" \
-      "$APP_JS"
-    print_ok "App.js reset — update the IP next time you run setup.sh (it does this automatically)"
-  else
-    print_skip "App.js not found"
-  fi
+  # With CloudFront, const API = "" is always correct (relative URLs)
+  # Nothing to reset — setup.sh confirms this on next run
+  print_skip "App.js uses relative URLs for CloudFront — no reset needed"
 }
 
 # =============================================================================
