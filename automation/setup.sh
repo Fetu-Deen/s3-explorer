@@ -4,33 +4,37 @@
 # =============================================================================
 #
 # What this script creates (in order):
-#   1.  S3 bucket              — stores uploaded files + thumbnails
-#   2.  IAM user               — credentials for Express server to access S3
-#   3.  IAM role for Lambda    — allows Lambda to read/write S3
-#   4.  EC2 security group     — allows SSH (22) and API traffic (4000)
-#   5.  RDS security group     — allows MySQL (3306) from EC2 only
-#   6.  RDS MySQL instance     — stores file metadata (name, size, description)
+#   1.  Prompts for DB password (or reads DB_PASSWORD env var)
+#   2.  S3 bucket              — stores uploaded files, thumbnails, React build
+#   3.  EC2 IAM role           — lets EC2 access S3 via instance profile (no keys)
+#   4.  Lambda IAM role        — lets Lambda read/write S3 + CloudWatch logs
+#   5.  Security groups        — EC2 (SSH+4000), RDS (MySQL from EC2 only)
+#   6.  RDS MySQL instance     — stores file metadata (runs async, waited later)
 #   7.  EC2 key pair           — SSH access to the server
-#   8.  EC2 instance           — runs the Express API server
-#   9.  Waits for RDS          — polls until database is available (~5-10 min)
-#   10. Updates App.js         — injects the new EC2 IP into the React app
+#   8.  EC2 instance           — t3.micro, Amazon Linux 2023, Node.js + PM2
+#   9.  Sets App.js API=""     — relative URLs so CloudFront routes /api/*
+#   10. Waits for RDS          — polls until database is available (~5-10 min)
 #   11. Waits for EC2 SSH      — polls until the instance accepts connections
 #   12. Waits for Node.js      — polls until user data finishes installing Node
 #   13. Deploys server.js      — SCPs code + .env to EC2, starts with PM2
 #   14. Builds Lambda on EC2   — installs sharp (Linux binary) and zips
-#   15. Creates Lambda         — uploads zip and configures the function
-#   16. S3 → Lambda trigger    — fires Lambda on every file upload
-#   17. Saves config           — writes cloudvault-config.env for teardown.sh
+#   15. S3 → Lambda trigger    — fires Lambda on every file upload
+#   16. Builds React + S3      — npm build, uploads to s3://bucket/app/
+#   17. Creates CloudFront     — CDN with S3 origin (/*) and EC2 origin (/api/*)
+#   18. Locks EC2 SG           — port 4000 restricted to CloudFront IPs only
+#   19. Saves config           — writes cloudvault-config.env for teardown.sh
 #
 # Prerequisites (must be installed before running):
 #   - AWS CLI  → brew install awscli  (then: aws configure)
 #   - jq       → brew install jq
+#   - Node.js  → brew install node
 #   - ssh, scp → pre-installed on Mac
 #   - zip      → pre-installed on Mac
 #
 # Usage:
 #   chmod +x setup.sh
 #   ./setup.sh
+#   (or non-interactively: DB_PASSWORD=yourpassword ./setup.sh)
 # =============================================================================
 
 set -e  # Exit immediately if any command fails
@@ -81,11 +85,13 @@ check_prerequisites() {
   print_step "0" "Checking prerequisites..."
 
   # Check required CLI tools are installed
-  for cmd in aws jq ssh scp zip; do
+  for cmd in aws jq ssh scp zip node npm; do
     if ! command -v "$cmd" &>/dev/null; then
       print_err "$cmd is not installed."
-      [ "$cmd" = "jq" ] && echo "    Run: brew install jq"
-      [ "$cmd" = "aws" ] && echo "    Run: brew install awscli && aws configure"
+      [ "$cmd" = "jq" ]   && echo "    Run: brew install jq"
+      [ "$cmd" = "aws" ]  && echo "    Run: brew install awscli && aws configure"
+      [ "$cmd" = "node" ] && echo "    Run: brew install node"
+      [ "$cmd" = "npm" ]  && echo "    Run: brew install node"
       exit 1
     fi
   done
@@ -691,8 +697,8 @@ build_and_upload_react() {
   print_step "16" "Building React app and uploading to S3..."
 
   cd "$APP_DIR"
-  npm install > /dev/null 2>&1
-  npm run build > /dev/null 2>&1
+  npm install > /dev/null 2>&1 || { print_err "npm install failed"; exit 1; }
+  npm run build > /dev/null 2>&1 || { print_err "npm run build failed"; exit 1; }
   cd "$SCRIPT_DIR"
 
   # Upload static assets with long cache (filenames are content-hashed)
