@@ -691,6 +691,7 @@ build_and_upload_react() {
   print_step "16" "Building React app and uploading to S3..."
 
   cd "$APP_DIR"
+  npm install > /dev/null 2>&1
   npm run build > /dev/null 2>&1
   cd "$SCRIPT_DIR"
 
